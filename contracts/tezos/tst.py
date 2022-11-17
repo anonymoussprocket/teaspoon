@@ -1,7 +1,7 @@
 # Reference implementation of the Trustless Staking Token for Tezos
 # Written using SmartPy (https://smartpy.io/ide)
 # Mike Radin
-# 2022, May; version 2.4
+# 2022, May; version 2.5
 
 import smartpy as sp
 
@@ -25,6 +25,7 @@ class Instrument(sp.Contract):
             periods = periods,
             start = start,
             freeCollateral = sp.mutez(0),
+            depositedCollateral = sp.mutez(0),
             balance_token = deployer,
             share_token = deployer,
             guarantors = sp.list([], t = sp.TAddress)
@@ -36,7 +37,7 @@ class Instrument(sp.Contract):
         sp.set_type(params.share_token, sp.TAddress)
 
         sp.verify(sp.sender == self.data.deployer, message = "Invalid request")
-        sp.verify(self.data.deployer == self.data.balance_token, message = "Already bootsrapped")
+        sp.verify(self.data.deployer == self.data.balance_token, message = "Already bootstrapped")
 
         BalanceBootstrapReference = sp.contract(sp.TAddress, params.balance_token, entry_point="bootstrap").open_some()
         sp.transfer(sp.self_address, sp.tez(0), BalanceBootstrapReference)
@@ -82,9 +83,10 @@ class Instrument(sp.Contract):
 
     @sp.entry_point
     def default(self):
-        sp.verify(self.data.deployer != self.data.balance_token, message = "Not bootsrapped")
+        sp.verify(self.data.deployer != self.data.balance_token, message = "Not bootstrapped")
 
         self.data.freeCollateral += sp.amount
+        self.data.depositedCollateral += sp.amount
 
     @sp.entry_point
     def deposit(self):
@@ -119,20 +121,7 @@ class Instrument(sp.Contract):
 
         currentPeriod = sp.local('currentPeriod', self.getPeriod())
 
-        xtzBalance = sp.split_tokens(self.data.schedule[currentPeriod.value], amount, 1)
-
-        releasedCollateral = sp.split_tokens(sp.tez(1) - self.data.schedule[currentPeriod.value], amount, 1)
-
-        self.data.freeCollateral += releasedCollateral
-
-        remainingBalance = sp.as_nat(currentBalance - amount)
-
-        BalanceBurnReference = sp.contract(BalanceBurnType, self.data.balance_token, entry_point="burn").open_some()
-        burn = sp.record(source = sp.sender, amount = amount)
-        burn = sp.set_type_expr(burn, BalanceBurnType)
-        sp.transfer(burn, sp.tez(0), BalanceBurnReference)
-
-        sp.send(sp.sender, xtzBalance)
+        self.redeemBalance(sp.sender, currentPeriod.value, amount)
 
     # proposalActive
     # proposalList
@@ -169,56 +158,86 @@ class Instrument(sp.Contract):
             currentBalance.value = sp.view("getBalance", self.data.balance_token, depositor).open_some("Incompatible view")
 
             sp.if (currentBalance.value > sp.nat(0)):
-                xtzBalance = sp.split_tokens(self.data.schedule[currentPeriod.value], currentBalance.value, 1)
-                releasedCollateral = sp.split_tokens(sp.tez(1) - self.data.schedule[currentPeriod.value], currentBalance.value, 1)
-
-                self.data.freeCollateral += releasedCollateral
-
-                BalanceBurnReference = sp.contract(BalanceBurnType, self.data.balance_token, entry_point="burn").open_some()
-                burn = sp.record(source = depositor, amount = currentBalance.value)
-                burn = sp.set_type_expr(burn, BalanceBurnType)
-                sp.transfer(burn, sp.tez(0), BalanceBurnReference)
-
-                sp.send(depositor, xtzBalance)
+                self.redeemBalance(depositor, currentPeriod.value, currentBalance.value)
             sp.else:
                 pass
 
     @sp.entry_point
     def depositCollateral(self):
-        sp.if (sp.len(self.data.guarantors) == 0):
+        totalShares = sp.local('totalShares', sp.nat(0))
+        totalShares.value = sp.view("getTotalSupply", self.data.share_token, sp.unit).open_some("Incompatible view")
+
+        shareIssue = sp.local('shareIssue', sp.nat(0))
+
+        sp.if (totalShares.value == 0) & (sp.len(self.data.guarantors) == 0):
+            shareIssue.value = sp.utils.mutez_to_nat(sp.amount)
+
             self.data.guarantors.push(sp.sender)
-
-            SetShareReference = sp.contract(SetShareType, self.data.share_token, entry_point="setBalance").open_some()
-            setShare = sp.record(account = sp.sender, amount = sp.nat(1000000))
-            setShare = sp.set_type_expr(setShare, SetShareType)
-            sp.transfer(setShare, sp.tez(0), SetShareReference)
         sp.else:
-            currentShare = sp.local('currentShare', sp.nat(0))
-            currentShare.value = sp.view("getBalance", self.data.share_token, sp.sender).open_some("Incompatible view")
+            sp.if (totalShares.value > 0) & (sp.len(self.data.guarantors) > 0):
+                numerator = sp.local('numerator', sp.nat(0))
+                numerator.value = sp.utils.mutez_to_nat(self.data.depositedCollateral + sp.amount)
+                numerator.value = numerator.value * totalShares.value
 
-            sp.if (currentShare.value == sp.nat(1000000)):
-                pass
+                shareIssue.value = sp.as_nat(sp.fst(sp.ediv(numerator.value, sp.utils.mutez_to_nat(self.data.depositedCollateral)).open_some()) - totalShares.value)
+
+                sp.if ~self.verifyGuarantor(sp.sender):
+                    self.data.guarantors.push(sp.sender)
+                sp.else:
+                    pass
             sp.else:
-                self.rebalanceCollateralDeposit(sp.utils.mutez_to_nat(sp.amount))
+                sp.failwith('Inconsistent token state')
+
+        ShareMintReference = sp.contract(BalanceMintType, self.data.share_token, entry_point="mint").open_some()
+        mint = sp.record(destination = sp.sender, amount = shareIssue.value)
+        mint = sp.set_type_expr(mint, BalanceMintType)
+        sp.transfer(mint, sp.tez(0), ShareMintReference)
 
         self.data.freeCollateral += sp.amount
+        self.data.depositedCollateral += sp.amount
 
     @sp.entry_point
-    def withdrawCollateral(self, amount):
+    def withdrawCollateral(self, amount): # TODO: amount should be mutez
         sp.set_type(amount, sp.TNat)
+
+        totalShares = sp.local('totalShares', sp.nat(0))
+        totalShares.value = sp.view("getTotalSupply", self.data.share_token, sp.unit).open_some("Incompatible view")
+
+        requiredShare = sp.local('requiredShare', sp.nat(0))
+        requiredShare.value = sp.utils.mutez_to_nat(sp.split_tokens(sp.utils.nat_to_mutez(amount), totalShares.value, sp.utils.mutez_to_nat(self.data.freeCollateral)))
 
         currentShare = sp.local('currentShare', sp.nat(0))
         currentShare.value = sp.view("getBalance", self.data.share_token, sp.sender).open_some("Incompatible view")
-        sp.verify(currentShare.value > sp.nat(0), message = "Not a guarantor")
 
-        share = sp.split_tokens(self.data.freeCollateral, currentShare.value, sp.nat(1000000))
-        sp.verify(sp.utils.mutez_to_nat(share) >= amount, message = "Requested amount exceeds total share")
+        sp.verify(currentShare.value > sp.nat(0), message = "Not a guarantor")
+        sp.verify(requiredShare.value <= currentShare.value, message = "Insufficient share")
+
+        share = sp.split_tokens(self.data.freeCollateral, requiredShare.value, totalShares.value)
+        sp.verify(share >= sp.utils.nat_to_mutez(sp.as_nat(amount - sp.nat(10))), message = "Requested amount exceeds total share") # TODO: rounding error "- 10"
         sp.verify(sp.utils.nat_to_mutez(amount) <= self.data.freeCollateral, message = "Insufficient free collateral")
 
-        self.rebalanceCollateralWithdrawal(amount)
+        ShareBurnReference = sp.contract(BalanceBurnType, self.data.share_token, entry_point="burn").open_some()
+        burn = sp.record(source = sp.sender, amount = requiredShare.value)
+        burn = sp.set_type_expr(burn, BalanceBurnType)
+        sp.transfer(burn, sp.tez(0), ShareBurnReference)
+
         self.data.freeCollateral -= sp.utils.nat_to_mutez(amount)
+        self.data.depositedCollateral -= sp.utils.nat_to_mutez(amount)
+
+        sp.if sp.as_nat(currentShare.value - requiredShare.value) == 0:
+            reducedGuarantors = sp.local('reducedGuarantors', sp.list([], t = sp.TAddress))
+            sp.for guarantor in self.data.guarantors:
+                sp.if (guarantor == sp.sender):
+                    pass
+                sp.else:
+                    reducedGuarantors.value.push(guarantor)
+            self.data.guarantors = reducedGuarantors.value
+        sp.else:
+            pass
+
         sp.send(sp.sender, sp.utils.nat_to_mutez(amount))
-        # TODO: deal with dust
+
+        # TODO: deal with dust and "late" reward deposits
 
     @sp.onchain_view(pure=True)
     def getGuarantorRedeemableValue(self, guarantor):
@@ -226,16 +245,23 @@ class Instrument(sp.Contract):
 
         currentShare = sp.local('currentShare', sp.nat(0))
         currentShare.value = sp.view("getBalance", self.data.share_token, guarantor).open_some("Incompatible view")
-        currentGuarantorBalance = sp.split_tokens(self.data.freeCollateral, currentShare.value, sp.nat(1000000))
+
+        totalShares = sp.local('totalShares', sp.nat(0))
+        totalShares.value = sp.view("getTotalSupply", self.data.share_token, sp.unit).open_some("Incompatible view")
+        
+        currentGuarantorBalance = sp.split_tokens(self.data.freeCollateral, currentShare.value, totalShares.value)
         sp.result(currentGuarantorBalance)
 
     @sp.onchain_view(pure=True)
-    def getGuaranteeRedeemableValue(self, amount):
+    def getGuaranteeRedeemableValue(self, amount): # TODO: rename amount since it's number of shares, not xtz
         sp.set_type(amount, sp.TNat)
 
-        sp.verify(amount <= sp.nat(1000000), message = "Invalid guarantee share")
+        totalShares = sp.local('totalShares', sp.nat(0))
+        totalShares.value = sp.view("getTotalSupply", self.data.share_token, sp.unit).open_some("Incompatible view")
 
-        currentGuarantorBalance = sp.split_tokens(self.data.freeCollateral, amount, sp.nat(1000000))
+        sp.verify(amount <= totalShares.value, message = "Invalid guarantee share")
+
+        currentGuarantorBalance = sp.split_tokens(self.data.freeCollateral, amount, totalShares.value)
         sp.result(currentGuarantorBalance)
 
     @sp.onchain_view(pure=True)
@@ -263,94 +289,8 @@ class Instrument(sp.Contract):
             y.value = self.data.periods
         sp.else:
             ttm = sp.as_nat(self.data.duration - sp.as_nat(sp.now - self.data.start))
-            y.value = (sp.as_nat(self.data.periods) - (ttm // self.data.interval) - 1)
+            y.value = sp.as_nat(self.data.periods - (ttm // self.data.interval) - 1)
         return y.value
-
-    def rebalanceCollateralDeposit(self, increase):
-        sp.set_type(increase, sp.TNat)
-
-        newCollateralBalance = sp.utils.mutez_to_nat(self.data.freeCollateral) + increase
-        currentCollateralBalance = self.data.freeCollateral
-
-        newGuarantor = sp.local('newGuarantor', True)
-        newGuarantorShare = sp.local('newGuarantorShare', sp.nat(0))
-        sp.for guarantor in self.data.guarantors:
-            currentShare_ = sp.local('currentShare_', sp.nat(0))
-            currentShare_.value = sp.view("getBalance", self.data.share_token, guarantor).open_some("Incompatible view")
-            currentGuarantorBalance = sp.local('currentGuarantorBalance', sp.mutez(0))
-            currentGuarantorBalance.value = sp.split_tokens(currentCollateralBalance, currentShare_.value, sp.nat(1000000))
-
-            sp.if (guarantor != sp.sender):
-                newGuarantorShare.value = sp.utils.mutez_to_nat(currentGuarantorBalance.value) * sp.nat(1000000) / newCollateralBalance
-            sp.else:
-                newGuarantor.value = False
-                newGuarantorBalance = sp.utils.mutez_to_nat(currentGuarantorBalance.value) + increase
-                newGuarantorShare.value = newGuarantorBalance * sp.nat(1000000) / newCollateralBalance
-
-            SetShareReference = sp.contract(SetShareType, self.data.share_token, entry_point="setBalance").open_some()
-            setShare = sp.record(account = guarantor, amount = newGuarantorShare.value)
-            setShare = sp.set_type_expr(setShare, SetShareType)
-            sp.transfer(setShare, sp.tez(0), SetShareReference)
-
-        sp.if (newGuarantor.value):
-            self.data.guarantors.push(sp.sender)
-
-            newGuarantorShare.value = increase * sp.nat(1000000) / newCollateralBalance
-            SetShareReference = sp.contract(SetShareType, self.data.share_token, entry_point="setBalance").open_some()
-            setShare = sp.record(account = sp.sender, amount = newGuarantorShare.value)
-            setShare = sp.set_type_expr(setShare, SetShareType)
-            sp.transfer(setShare, sp.tez(0), SetShareReference)
-
-    def rebalanceCollateralWithdrawal(self, decrease):
-        sp.trace('rebalanceCollateralWithdrawal')
-        sp.trace(sp.sender)
-        sp.set_type(decrease, sp.TNat)
-
-        sp.trace('current, new')
-        currentCollateralBalance = self.data.freeCollateral
-        newCollateralBalance = sp.as_nat(sp.utils.mutez_to_nat(self.data.freeCollateral) - decrease)
-        sp.trace(currentCollateralBalance)
-        sp.trace(newCollateralBalance)
-
-        removeGuarantor = sp.local('removeGuarantor', False)
-        sp.for guarantor in self.data.guarantors:
-            currentShare_ = sp.local('currentShare_', sp.nat(0))
-            currentShare_.value = sp.view("getBalance", self.data.share_token, guarantor).open_some("Incompatible view")
-            currentGuarantorBalance = sp.local('currentGuarantorBalance', sp.mutez(0))
-            currentGuarantorBalance.value = sp.split_tokens(currentCollateralBalance, currentShare_.value, sp.nat(1000000))
-
-            sp.if (guarantor != sp.sender):
-                newGuarantorShare = sp.utils.mutez_to_nat(currentGuarantorBalance.value) * sp.nat(1000000) / newCollateralBalance
-
-                SetShareReference = sp.contract(SetShareType, self.data.share_token, entry_point="setBalance").open_some()
-                setShare = sp.record(account = guarantor, amount = newGuarantorShare)
-                setShare = sp.set_type_expr(setShare, SetShareType)
-                sp.transfer(setShare, sp.tez(0), SetShareReference)
-            sp.else:
-                newGuarantorBalance = sp.local('newGuarantorBalance', sp.as_nat(sp.utils.mutez_to_nat(currentGuarantorBalance.value) - decrease))
-                sp.if (newGuarantorBalance.value < sp.nat(500)):
-                    SetShareReference = sp.contract(SetShareType, self.data.share_token, entry_point="setBalance").open_some()
-                    setShare = sp.record(account = guarantor, amount = sp.nat(0))
-                    setShare = sp.set_type_expr(setShare, SetShareType)
-                    sp.transfer(setShare, sp.tez(0), SetShareReference)
-
-                    removeGuarantor.value = True
-                sp.else:
-                    newGuarantorShare = newGuarantorBalance.value * sp.nat(1000000) / newCollateralBalance
-
-                    SetShareReference = sp.contract(SetShareType, self.data.share_token, entry_point="setBalance").open_some()
-                    setShare = sp.record(account = guarantor, amount = newGuarantorShare)
-                    setShare = sp.set_type_expr(setShare, SetShareType)
-                    sp.transfer(setShare, sp.tez(0), SetShareReference)
-
-        sp.if (removeGuarantor.value):
-            reducedGuarantors = sp.local('reducedGuarantors', sp.list([], t = sp.TAddress))
-            sp.for guarantor in self.data.guarantors:
-                sp.if (guarantor == sp.sender):
-                    pass
-                sp.else:
-                    reducedGuarantors.value.push(guarantor)
-            self.data.guarantors = reducedGuarantors.value
 
     def verifyGuarantor(self, account):
         isGuarantor = sp.local('isGuarantor', False)
@@ -361,3 +301,20 @@ class Instrument(sp.Contract):
                 pass
 
         return isGuarantor.value
+
+    def redeemBalance(self, depositor, currentPeriod, currentBalance):
+        sp.set_type(depositor, sp.TAddress)
+        sp.set_type(currentPeriod, sp.TNat)
+        sp.set_type(currentBalance, sp.TNat)
+
+        xtzBalance = sp.split_tokens(self.data.schedule[currentPeriod], currentBalance, 1)
+        releasedCollateral = sp.split_tokens(sp.tez(1) - self.data.schedule[currentPeriod], currentBalance, 1)
+
+        self.data.freeCollateral += releasedCollateral
+
+        BalanceBurnReference = sp.contract(BalanceBurnType, self.data.balance_token, entry_point="burn").open_some()
+        burn = sp.record(source = depositor, amount = currentBalance)
+        burn = sp.set_type_expr(burn, BalanceBurnType)
+        sp.transfer(burn, sp.tez(0), BalanceBurnReference)
+
+        sp.send(depositor, xtzBalance)
