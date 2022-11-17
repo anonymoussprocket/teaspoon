@@ -1,9 +1,13 @@
 # Reference implementation of the Trustless Staking Token for Tezos
 # Written using SmartPy (https://smartpy.io/ide)
 # Mike Radin
-# 2022, May; version 2.1
+# 2022, May; version 2.2
 
 import smartpy as sp
+
+DELEGATE_THRESHOLD = 650000
+MINIMUM_DEPOSIT = 10000000
+MINIMUM_GUARANTEE = 1000000
 
 class Instrument(sp.Contract):
     def __init__(self, schedule, duration, interval, periods, start):
@@ -43,7 +47,8 @@ class Instrument(sp.Contract):
             wholeCoins = sp.fst(coins.open_some())
             sp.verify(tokenBalance.value > wholeCoins, message = "Deposit too low")
             requiredCollateral.value = sp.utils.nat_to_tez(sp.as_nat(tokenBalance.value - wholeCoins))
-
+        sp.trace('requiredCollateral')
+        sp.trace(requiredCollateral.value)
         sp.verify(requiredCollateral.value <= self.data.freeCollateral, message = "Insufficient collateral")
 
         self.data.freeCollateral -= requiredCollateral.value
@@ -61,12 +66,20 @@ class Instrument(sp.Contract):
         # TODO: allow approved to redeem
         sp.verify(self.data.balances[sp.sender].balance >= amount, message = "Insufficient token balance")
 
-        xtzBalance = self.getRedemptionValue(amount)
-        releasedCollateral = sp.utils.nat_to_tez(amount) - xtzBalance
+        currentPeriod = sp.local('currentPeriod', self.getPeriod())
+
+        xtzBalance = sp.split_tokens(self.data.schedule[currentPeriod.value], amount, 1)
+
+        releasedCollateral = sp.split_tokens(sp.tez(1) - self.data.schedule[currentPeriod.value], amount, 1)
 
         self.data.freeCollateral += releasedCollateral
 
-        self.data.balances[sp.sender].balance = sp.as_nat(self.data.balances[sp.sender].balance - amount)
+        remainingBalance = sp.as_nat(self.data.balances[sp.sender].balance - amount)
+        sp.if (remainingBalance > 0):
+            self.data.balances[sp.sender].balance = remainingBalance
+        sp.else:
+            del self.data.balances[sp.sender]
+
         sp.send(sp.sender, xtzBalance)
 
     @sp.entry_point
@@ -119,19 +132,48 @@ class Instrument(sp.Contract):
     #     )
     # )
 
+    # proposalActive
+    # proposalList
+
+    # @sp.entry_point
+    # def proposeDelegate(self, delegate):
+    #     pass
+    #     sp.level
+
     @sp.entry_point
     def setDelegate(self, delegate):
         sp.set_type(delegate, sp.TOption(sp.TKeyHash))
 
-        isGuarantor = sp.local('isGuarantor', False)
-        sp.for guarantor in self.data.guarantors:
-            sp.if (guarantor == sp.sender):
-                isGuarantor.value = True
+        sp.verify(self.verifyGuarantor(sp.sender), message = "Not a guarantor")
+
+        sp.if (self.data.collateral[sp.sender] >= DELEGATE_THRESHOLD):
+            sp.set_delegate(delegate)
+        sp.else:
+            pass
+
+    @sp.entry_point
+    def terminate(self, depositors):
+        sp.set_type(depositors, sp.TList(sp.TAddress))
+
+        currentPeriod = sp.local('currentPeriod', self.getPeriod())
+        sp.verify(self.verifyGuarantor(sp.sender), message = "Not a guarantor")
+        sp.verify(currentPeriod.value == self.data.periods, message = "Validity period not complete")
+
+        sp.for depositor in depositors:
+            sp.if (self.data.balances.contains(depositor)):
+                xtzBalance = sp.split_tokens(self.data.schedule[currentPeriod.value], self.data.balances[depositor].balance, 1)
+                releasedCollateral = sp.split_tokens(sp.tez(1) - self.data.schedule[currentPeriod.value], self.data.balances[depositor].balance, 1)
+
+                self.data.freeCollateral += releasedCollateral
+
+                self.data.balances[depositor].balance = sp.nat(0)
+                self.data.balances[depositor].approvals = sp.map()
+                sp.send(depositor, xtzBalance)
             sp.else:
                 pass
-        sp.verify(isGuarantor.value, message = "Not a guarantor")
 
-        sp.set_delegate(delegate)
+        sp.for depositor in depositors:
+            del self.data.balances[depositor]
 
     @sp.entry_point
     def depositCollateral(self):
@@ -171,21 +213,32 @@ class Instrument(sp.Contract):
         sp.else:
             sp.result(self.data.freeCollateral)
 
+    @sp.onchain_view(pure=True)
+    def getDepositorRedeemableValue(self, depositor):
+        sp.set_type(depositor, sp.TAddress)
+
+        sp.verify(self.data.balances.contains(depositor), message = "Address has no balance")
+
+        currentPeriod = sp.local('currentPeriod', self.getPeriod())
+
+        sp.result(sp.split_tokens(self.data.schedule[currentPeriod.value], self.data.balances[depositor].balance, 1))
+
+    @sp.onchain_view(pure=True)
+    def getDepositRedeemableValue(self, amount):
+        sp.set_type(amount, sp.TNat)
+
+        currentPeriod = sp.local('currentPeriod', self.getPeriod())
+
+        sp.result(sp.split_tokens(self.data.schedule[currentPeriod.value], amount, 1))
+
     def getPeriod(self):
         y = sp.local('y', self.data.periods)
         sp.if sp.now > self.data.start.add_seconds(sp.to_int(self.data.duration)):
             y.value = self.data.periods
         sp.else:
             ttm = sp.as_nat(self.data.duration - sp.as_nat(sp.now - self.data.start))
-            y.value = (sp.as_nat(self.data.periods) - (ttm // self.data.interval))
+            y.value = (sp.as_nat(self.data.periods) - (ttm // self.data.interval) - 1)
         return y.value
-
-    def getRedemptionValue(self, amount):
-        sp.set_type(amount, sp.TNat)
-
-        period = self.getPeriod() # TODO: needs a concept of minimum holding period
-
-        return sp.split_tokens(self.data.schedule[period], amount, 1)
 
     def rebalanceCollateralDeposit(self, increase):
         sp.set_type(increase, sp.TNat)
@@ -246,6 +299,16 @@ class Instrument(sp.Contract):
                     reducedGuarantors.value.push(guarantor)
             self.data.guarantors = reducedGuarantors.value
 
+    def verifyGuarantor(self, account):
+        isGuarantor = sp.local('isGuarantor', False)
+        sp.for guarantor in self.data.guarantors:
+            sp.if (guarantor == account):
+                isGuarantor.value = True
+            sp.else:
+                pass
+
+        return isGuarantor.value
+
 @sp.add_test("Instrument")
 def test():
     scenario = sp.test_scenario()
@@ -259,6 +322,7 @@ def test():
     david = sp.test_account("David") # depositor
     elanore = sp.test_account("Elanore") # depositor
     francois = sp.test_account("Francois") # baker/validator
+    gwen = sp.test_account("Gwendolyn") # depositor
 
     rates = [952380, 957557, 962763, 967996, 973258, 978548, 983868, 989216, 994593, 1000000, 1000000] # TODO: adding n+1th item is a bug
     schedule = { i : sp.mutez(rates[i]) for i in range(0, len(rates) ) }
@@ -288,6 +352,9 @@ def test():
 
     scenario.h3("Cindy fails to deposit 50,000 xtz")
     scenario += instrument.deposit().run(sender = cindy, amount = sp.tez(50000), now = time, valid = False)
+
+    scenario.h3("Gwendolyn deposits 1000xtz")
+    scenario += instrument.deposit().run(sender = gwen, amount = sp.tez(1000), now = time)
 
     scenario.h2("Period 1")
     time = sp.timestamp(60*60*24*1 + 1001)
@@ -322,8 +389,8 @@ def test():
     scenario.h3("Elanore pulls 400 tokens from David's allowance")
     scenario += instrument.transfer(destination = elanore.address, source = david.address, tokenBalance = 400).run(sender = elanore, now = time)
 
-    scenario.h3("David redeems 1050 tokens for xxx xtz")
-    scenario += instrument.redeem(sp.nat(1050)).run(sender = david, now = time)
+    # scenario.h3("David redeems 1050 tokens for xxx xtz")
+    # scenario += instrument.redeem(sp.nat(1050)).run(sender = david, now = time)
 
     scenario.h2("Period 4")
     time = sp.timestamp(60*60*24*4 + 1001)
@@ -341,7 +408,7 @@ def test():
     #scenario += instrument.setDelegate(baker = sp.some(david.public_key_hash)).run(sender = issuer)
     #scenario += instrument.withdrawCollateral(amount = sp.mutez(1_450_000_000)).run(sender = issuer, now = 60*60*24*8 + 1, valid = False)
 
-    scenario.h2("Period 5 - 10")
+    scenario.h2("Period 5 - 8")
     scenario.h3("Francois deposits 100xtz reward")
     scenario += instrument.default().run(sender = francois, amount = sp.tez(100), now = time)
 
@@ -353,6 +420,15 @@ def test():
 
     scenario.h3("Francois deposits 100xtz reward")
     scenario += instrument.default().run(sender = francois, amount = sp.tez(100), now = time)
+
+    scenario.h2("Period 9")
+    time = sp.timestamp(60*60*24*9 + 1001)
+
+    scenario.h3("Alice fails to terminate contract")
+    scenario += instrument.terminate([david.address, elanore.address]).run(sender = alice, now = time, valid = False)
+
+    scenario.h3("Cindy fails to terminate contract")
+    scenario += instrument.terminate([david.address, elanore.address]).run(sender = cindy, now = time, valid = False)
 
     scenario.h3("Francois deposits 100xtz reward")
     scenario += instrument.default().run(sender = francois, amount = sp.tez(100), now = time)
@@ -362,6 +438,9 @@ def test():
 
     scenario.h2("Period 11")
     time = sp.timestamp(60*60*24*11 + 1001)
+
+    scenario.h3("Cindy fails to terminate contract")
+    scenario += instrument.terminate([david.address, elanore.address]).run(sender = cindy, now = time, valid = False)
 
     scenario.h3("Francois deposits 100xtz reward")
     scenario += instrument.default().run(sender = francois, amount = sp.tez(100), now = time)
@@ -377,20 +456,23 @@ def test():
     scenario += instrument.withdrawCollateral(sp.nat(100000000)).run(sender = alice, now = time)
 
     scenario.h3("Depositors withdraw their tokens")
-    scenario += instrument.redeem(sp.nat(621)).run(sender = david, now = time)
-    scenario += instrument.redeem(sp.nat(400)).run(sender = elanore, now = time)
+    scenario += instrument.redeem(sp.nat(521)).run(sender = david, now = time)
+    scenario += instrument.redeem(sp.nat(300)).run(sender = elanore, now = time)
 
     scenario.h2("Period 15")
     time = sp.timestamp(60*60*24*15 + 1001)
-    scenario.h3("Withdraw Robert's deposit amount")
-    scenario.show(sp.view("getGuarantorRedeemableValue", instrument.address, bob.address, t = sp.TMutez))
-    scenario += instrument.withdrawCollateral(sp.nat(1502209334)).run(sender = bob, now = time)
+    # scenario.h3("Withdraw Robert's deposit amount")
+    # scenario.show(sp.view("getGuarantorRedeemableValue", instrument.address, bob.address, t = sp.TMutez))
+    # scenario += instrument.withdrawCollateral(sp.nat(1502209334)).run(sender = bob, now = time)
 
-    scenario.h3("Withdraw Alice's remaining deposit amount")
-    scenario.show(sp.view("getGuarantorRedeemableValue", instrument.address, alice.address, t = sp.TMutez))
-    scenario += instrument.withdrawCollateral(sp.nat(1354862991)).run(sender = alice, now = time)
+    # scenario.h3("Withdraw Alice's remaining deposit amount")
+    # scenario.show(sp.view("getGuarantorRedeemableValue", instrument.address, alice.address, t = sp.TMutez))
+    # scenario += instrument.withdrawCollateral(sp.nat(1354862991)).run(sender = alice, now = time)
 
     scenario.show(instrument.balance)
-    scenario.verify(instrument.balance < sp.mutez(100000), message = "Larger left-over balance")
+    scenario.verify(instrument.balance < sp.mutez(100000))
+
+    scenario.h3("Alice terminates contract")
+    scenario += instrument.terminate([david.address, elanore.address]).run(sender = alice, now = time)
 
     #scenario.simulation(instrument)
