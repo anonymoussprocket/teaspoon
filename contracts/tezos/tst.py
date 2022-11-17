@@ -1,19 +1,19 @@
 # Reference implementation of the Trustless Staking Token for Tezos
 # Written using SmartPy (https://smartpy.io/ide)
 # Mike Radin
-# 2022, May; version 2.5
+# 2022, May; version 2.6
 
 import smartpy as sp
 
 BalanceTransferType = sp.TRecord(from_ = sp.TAddress, to_ = sp.TAddress, value = sp.TNat).layout(("from_ as from", ("to_ as to", "value")))
 BalanceMintType = sp.TRecord(destination = sp.TAddress, amount = sp.TNat).layout(("destination", "amount"))
 BalanceBurnType = sp.TRecord(source = sp.TAddress, amount = sp.TNat).layout(("source", "amount"))
-SetShareType = sp.TRecord(account = sp.TAddress, amount = sp.TNat).layout(("account", "amount"))
-RegisterShareType = sp.TRecord(account = sp.TAddress, amount = sp.TNat).layout(("account", "amount"))
+TransferHookType = sp.TRecord(source = sp.TAddress, amount = sp.TAddress).layout(("source", "destination")) # TODO: maybe later
 
-DELEGATE_THRESHOLD = 650000
-MINIMUM_DEPOSIT = 10000000
-MINIMUM_GUARANTEE = 1000000
+VOTE_THRESHOLD = 51
+VOTE_MARGIN = 2
+PROPOSAL_VOTE_DURATION = 8192
+PROPOSAL_APPLICATION_DURATION = 512
 
 class Instrument(sp.Contract):
     def __init__(self, deployer, schedule, duration, interval, periods, start):
@@ -28,7 +28,12 @@ class Instrument(sp.Contract):
             depositedCollateral = sp.mutez(0),
             balance_token = deployer,
             share_token = deployer,
-            guarantors = sp.list([], t = sp.TAddress)
+            proposal = sp.record(
+                level = sp.nat(0),
+                validator = sp.key_hash("tz1Ke2h7sDdakHJQh8WX4Z372du1KChsksyU"),
+                votes = sp.map(l = {}, tkey = sp.TAddress, tvalue = sp.TRecord(weight = sp.TNat, vote = sp.TBool)),
+                duration = sp.nat(0)
+            )
         )
 
     @sp.entry_point
@@ -48,38 +53,6 @@ class Instrument(sp.Contract):
         self.data.balance_token = params.balance_token
         self.data.share_token = params.share_token
         self.data.deployer = sp.address('tz1Ke2h7sDdakHJQh8WX4Z372du1KChsksyU')
-
-    @sp.entry_point
-    def registerShare(self, params):
-        sp.set_type(params.account, sp.TAddress)
-        sp.set_type(params.amount, sp.TNat)
-
-        sp.verify(sp.sender == self.data.share_token, message = "Invalid call")
-
-        removeGuarantor = sp.local('removeGuarantor', False)
-        newGuarantor = sp.local('newGuarantor', True)
-        sp.for guarantor in self.data.guarantors:
-            sp.if (guarantor == params.account):
-                sp.if (params.amount > sp.nat(0)):
-                    newGuarantor.value = False
-                sp.else:
-                    removeGuarantor.value = True
-
-        sp.if (removeGuarantor.value == True):
-            reducedGuarantors = sp.local('reducedGuarantors', sp.list([], t = sp.TAddress))
-            sp.for guarantor in self.data.guarantors:
-                sp.if (guarantor == sp.sender):
-                    pass
-                sp.else:
-                    reducedGuarantors.value.push(guarantor)
-            self.data.guarantors = reducedGuarantors.value
-        sp.else:
-            pass
-
-        sp.if (newGuarantor.value == True):
-            self.data.guarantors.push(params.account)
-        sp.else:
-            pass
 
     @sp.entry_point
     def default(self):
@@ -123,34 +96,89 @@ class Instrument(sp.Contract):
 
         self.redeemBalance(sp.sender, currentPeriod.value, amount)
 
-    # proposalActive
-    # proposalList
-
-    # @sp.entry_point
-    # def proposeDelegate(self, delegate):
-    #     pass
-    #     sp.level
-
     @sp.entry_point
-    def setDelegate(self, delegate):
-        sp.set_type(delegate, sp.TOption(sp.TKeyHash))
+    def proposeDelegate(self, delegate):
+        sp.set_type(delegate, sp.TKeyHash)
 
-        sp.verify(self.verifyGuarantor(sp.sender), message = "Not a guarantor")
+        proposerBalance = sp.local('proposerBalance', sp.nat(0))
+        proposerBalance.value = sp.view("getBalance", self.data.share_token, sp.sender).open_some("Incompatible view")
+        sp.verify(proposerBalance.value > 0, message = "Not a guarantor")
 
-        currentShare = sp.local('currentShare', sp.nat(0))
-        currentShare.value = sp.view("getBalance", self.data.share_token, sp.sender).open_some("Incompatible view")
-
-        sp.if (currentShare.value >= DELEGATE_THRESHOLD):
-            sp.set_delegate(delegate)
+        sp.if (sp.level < self.data.proposal.level + self.data.proposal.duration + PROPOSAL_APPLICATION_DURATION):
+            sp.failwith("Proposal active")
         sp.else:
             pass
+
+        totalSupply = sp.local('totalSupply', sp.nat(0))
+        totalSupply.value = sp.view("getTotalSupply", self.data.share_token, sp.unit).open_some("Incompatible view")
+
+        sp.if (totalSupply.value == proposerBalance.value):
+            sp.set_delegate(sp.some(delegate))
+        sp.else:
+            proposerShare = sp.fst(sp.ediv(proposerBalance.value * sp.nat(100), totalSupply.value).open_some())
+
+            sp.if (proposerShare >= VOTE_THRESHOLD):
+                sp.set_delegate(sp.some(delegate))
+            sp.else:
+                self.data.proposal = sp.record(
+                    level = sp.level,
+                    validator = delegate,
+                    votes = sp.map(tkey = sp.TAddress, tvalue = sp.TRecord(weight = sp.TNat, vote = sp.TBool)),
+                    duration = sp.nat(PROPOSAL_VOTE_DURATION))
+                self.data.proposal.votes[sp.sender] = sp.record(weight = proposerBalance.value, vote = True)
+
+    @sp.entry_point
+    def applyProposal(self, vote):
+        sp.set_type(vote, sp.TBool)
+
+        proposerBalance = sp.local('proposerBalance', sp.nat(0))
+        proposerBalance.value = sp.view("getBalance", self.data.share_token, sp.sender).open_some("Incompatible view")
+        sp.verify(proposerBalance.value > 0, message = "Not a guarantor")
+
+        sp.verify(self.data.proposal.level != sp.nat(0), message = "No proposal")
+
+        sp.if (sp.as_nat(sp.level - self.data.proposal.level) < self.data.proposal.duration):
+            self.data.proposal.votes[sp.sender] = sp.record(weight = proposerBalance.value, vote = vote)
+        sp.else:
+            yeaShare = sp.local('yeaShare', sp.nat(0))
+            nayShare = sp.local('nayShare', sp.nat(0))
+            totalSupply = sp.local('totalSupply', sp.nat(0))
+            totalSupply.value = sp.view("getTotalSupply", self.data.share_token, sp.unit).open_some("Incompatible view")
+
+            sp.for guarantor in self.data.proposal.votes.keys():
+                proposerBalance.value = sp.view("getBalance", self.data.share_token, guarantor).open_some("Incompatible view")
+                proposerBalance.value += self.data.proposal.votes[guarantor].weight
+                proposerBalance.value /= 2
+
+                sp.if (self.data.proposal.votes[guarantor].vote):
+                    yeaShare.value += proposerBalance.value
+                sp.else:
+                    nayShare.value += proposerBalance.value
+
+            voteDifference = sp.as_nat(yeaShare.value - nayShare.value)
+            voteDifferenceShare = sp.fst(sp.ediv(voteDifference * sp.nat(100), totalSupply.value).open_some())
+            totalVotes = yeaShare.value + nayShare.value
+            voteShare = sp.fst(sp.ediv(totalVotes * sp.nat(100), totalSupply.value).open_some())
+            sp.if (voteShare > VOTE_THRESHOLD) & (voteDifferenceShare >= VOTE_MARGIN):
+                sp.set_delegate(sp.some(self.data.proposal.validator))
+            sp.else:
+                pass
+
+            self.data.proposal = sp.record(
+                level = sp.nat(0),
+                validator = sp.key_hash("tz1Ke2h7sDdakHJQh8WX4Z372du1KChsksyU"),
+                votes = sp.map(l = {}, tkey = sp.TAddress, tvalue = sp.TRecord(weight = sp.TNat, vote = sp.TBool)),
+                duration = sp.nat(0))
 
     @sp.entry_point
     def terminate(self, depositors):
         sp.set_type(depositors, sp.TList(sp.TAddress))
 
+        guarantorBalance = sp.local('guarantorBalance', sp.nat(0))
+        guarantorBalance.value = sp.view("getBalance", self.data.share_token, sp.sender).open_some("Incompatible view")
+        sp.verify(guarantorBalance.value > 0, message = "Not a guarantor")
+
         currentPeriod = sp.local('currentPeriod', self.getPeriod())
-        sp.verify(self.verifyGuarantor(sp.sender), message = "Not a guarantor")
         sp.verify(currentPeriod.value == self.data.periods, message = "Validity period not complete")
 
         currentBalance = sp.local('currentBalance', sp.nat(0))
@@ -169,22 +197,15 @@ class Instrument(sp.Contract):
 
         shareIssue = sp.local('shareIssue', sp.nat(0))
 
-        sp.if (totalShares.value == 0) & (sp.len(self.data.guarantors) == 0):
+        sp.if (totalShares.value == 0):
             shareIssue.value = sp.utils.mutez_to_nat(sp.amount)
-
-            self.data.guarantors.push(sp.sender)
         sp.else:
-            sp.if (totalShares.value > 0) & (sp.len(self.data.guarantors) > 0):
+            sp.if (totalShares.value > 0):
                 numerator = sp.local('numerator', sp.nat(0))
                 numerator.value = sp.utils.mutez_to_nat(self.data.depositedCollateral + sp.amount)
                 numerator.value = numerator.value * totalShares.value
 
                 shareIssue.value = sp.as_nat(sp.fst(sp.ediv(numerator.value, sp.utils.mutez_to_nat(self.data.depositedCollateral)).open_some()) - totalShares.value)
-
-                sp.if ~self.verifyGuarantor(sp.sender):
-                    self.data.guarantors.push(sp.sender)
-                sp.else:
-                    pass
             sp.else:
                 sp.failwith('Inconsistent token state')
 
@@ -224,20 +245,9 @@ class Instrument(sp.Contract):
         self.data.freeCollateral -= sp.utils.nat_to_mutez(amount)
         self.data.depositedCollateral -= sp.utils.nat_to_mutez(amount)
 
-        sp.if sp.as_nat(currentShare.value - requiredShare.value) == 0:
-            reducedGuarantors = sp.local('reducedGuarantors', sp.list([], t = sp.TAddress))
-            sp.for guarantor in self.data.guarantors:
-                sp.if (guarantor == sp.sender):
-                    pass
-                sp.else:
-                    reducedGuarantors.value.push(guarantor)
-            self.data.guarantors = reducedGuarantors.value
-        sp.else:
-            pass
-
         sp.send(sp.sender, sp.utils.nat_to_mutez(amount))
 
-        # TODO: deal with dust and "late" reward deposits
+        # TODO: deal with dust
 
     @sp.onchain_view(pure=True)
     def getGuarantorRedeemableValue(self, guarantor):
@@ -291,16 +301,6 @@ class Instrument(sp.Contract):
             ttm = sp.as_nat(self.data.duration - sp.as_nat(sp.now - self.data.start))
             y.value = sp.as_nat(self.data.periods - (ttm // self.data.interval) - 1)
         return y.value
-
-    def verifyGuarantor(self, account):
-        isGuarantor = sp.local('isGuarantor', False)
-        sp.for guarantor in self.data.guarantors:
-            sp.if (guarantor == account):
-                isGuarantor.value = True
-            sp.else:
-                pass
-
-        return isGuarantor.value
 
     def redeemBalance(self, depositor, currentPeriod, currentBalance):
         sp.set_type(depositor, sp.TAddress)
